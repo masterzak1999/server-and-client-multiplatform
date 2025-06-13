@@ -1,55 +1,6 @@
-# Server & Client
+# Server & Client Multiplatform
 #### Author: Bocaletto Luca
 
-# 🔧 Remote-Cmd v3
-
-**Server & Client in C con autenticazione, syslog e graceful shutdown**
-
----
-
-## ⚙️ Compilazione
-
-	compila il server:
-		gcc -Wall -O2 -pthread -o server server.c
-
-	compila il client:
-		gcc -Wall -O2 -o client client.c
-
----
-
-## 🚀 Avvio Server
-
-	# Avvio con autenticazione e aggiornamento del sistema
-	sudo ./server -k mysecret -u
-
-	# Modalità dry-run (non esegue comandi reali)
-	./server -k mysecret -d
-
----
-
-## 🧪 Connessione Client
-
-	# Dry-run (visualizza i comandi senza inviarli)
-	./client -h 127.0.0.1 -p 12345 -k mysecret -d
-
-	# Connessione reale
-	./client -h 127.0.0.1 -p 12345 -k mysecret
-
-	Esempio interazione:
-
-		ls -l
-		uname -a
-		exit
-
----
-
-## 🔐 Autenticazione
-
-	Il server richiede un token di autenticazione passato via `-k mysecret`.
-
-	Il client lo invia alla connessione. In caso di token errato, riceverà `AUTH_FAIL`.
-
----
 
 ## ⚙️ Opzioni Server
 
