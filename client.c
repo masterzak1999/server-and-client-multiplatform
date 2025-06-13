@@ -5,78 +5,74 @@
 #include <string.h>
 
 #define BUF_SZ 4096
-#define VERSION "1.0.0"
 
 static void usage(const char *prog) {
   fprintf(stderr,
-    "Client %s\n"
-    "Usage: %s -h HOST -p PORT -k TOKEN [-d]\n"
-    "  -h HOST   server address\n"
-    "  -p PORT   server port\n"
-    "  -k TOKEN  auth token\n"
-    "  -d        dry-run\n",
-    VERSION, prog);
+    "Usage: %s -h HOST -p PORT -k TOKEN [-d]\n", prog);
   exit(1);
 }
 
 int main(int argc, char **argv) {
   char *host = NULL, *port = NULL, *key = NULL;
-  int dry_run = 0;
+  int  dry_run = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "-h") == 0 && i+1<argc) host = argv[++i];
-    else if (strcmp(argv[i], "-p") == 0 && i+1<argc) port = argv[++i];
-    else if (strcmp(argv[i], "-k") == 0 && i+1<argc) key  = argv[++i];
-    else if (strcmp(argv[i], "-d") == 0)             dry_run = 1;
+    if (!strcmp(argv[i], "-h") && i+1<argc) host = argv[++i];
+    else if (!strcmp(argv[i], "-p") && i+1<argc) port = argv[++i];
+    else if (!strcmp(argv[i], "-k") && i+1<argc) key  = argv[++i];
+    else if (!strcmp(argv[i], "-d"))             dry_run = 1;
   }
   if (!host || !port || !key) usage(argv[0]);
 
   init_net();
+  socket_t sock;
   if (!dry_run) {
     struct addrinfo hints = {
       .ai_family   = AF_UNSPEC,
       .ai_socktype = SOCK_STREAM
     }, *res;
-    if (getaddrinfo(host, port, &hints, &res) != 0) {
-      perror("getaddrinfo"); return 1;
-    }
-    socket_t sock = socket(res->ai_family, res->ai_socktype, 0);
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-      perror("connect"); return 1;
-    }
+    getaddrinfo(host, port, &hints, &res);
+    sock = socket(res->ai_family, res->ai_socktype, 0);
+    connect(sock, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
 
-    /* send token */
-    send(sock, key, strlen(key), 0);
-    send(sock, "\n", 1, 0);
+    send_enc(sock, key, strlen(key), key, strlen(key));
+    send_enc(sock, "\n", 1, key, strlen(key));
+
     char ack[BUF_SZ];
-    if (recv(sock, ack, sizeof(ack)-1, 0) <= 0 ||
-        strncmp(ack, "OK", 2) != 0) {
+    recv_enc(sock, ack, sizeof(ack), key, strlen(key));
+    if (strncmp(ack, "OK", 2) != 0) {
       fprintf(stderr, "Auth failed\n");
-      close_socket(sock);
       return 1;
     }
     printf("Connected to %s:%s\n", host, port);
+  }
 
-    /* interactive shell */
-    while (fgets(ack, sizeof(ack), stdin)) {
-      if (ack[strlen(ack)-1] == '\n')
-        ack[strlen(ack)-1] = '\0';
-      if (strcmp(ack, "exit") == 0) break;
-      send(sock, ack, strlen(ack), 0);
-      send(sock, "\n", 1, 0);
-      ssize_t n;
-      while ((n = recv(sock, ack, sizeof(ack)-1, MSG_DONTWAIT)) > 0) {
-        ack[n] = '\0';
-        printf("%s", ack);
-      }
+  char buf[BUF_SZ];
+  while (fgets(buf, BUF_SZ, stdin)) {
+    buf[strcspn(buf, "\n")] = '\0';
+    if (strcmp(buf, "exit") == 0) break;
+
+    if (dry_run) {
+      printf("[DRY] %s\n", buf);
+      continue;
     }
-    close_socket(sock);
+    if (!strncasecmp(buf, "GET ", 4) || !strncasecmp(buf, "PUT ", 4)) {
+      send_enc(sock, buf, strlen(buf), key, strlen(key));
+      send_enc(sock, "\n", 1, key, strlen(key));
+      /* handle in server */
+      continue;
+    }
+
+    send_enc(sock, buf, strlen(buf), key, strlen(key));
+    send_enc(sock, "\n", 1, key, strlen(key));
+
+    ssize_t n;
+    while ((n = recv_enc(sock, buf, BUF_SZ, key, strlen(key))) > 0)
+      printf("%.*s", (int)n, buf);
   }
-  else {
-    printf("[DRY] Would connect %s:%s with key '%s'\n",
-           host, port, key);
-  }
+
+  if (!dry_run) close_socket(sock);
   cleanup_net();
   return 0;
 }
