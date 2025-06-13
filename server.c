@@ -7,15 +7,14 @@
 #include <stdarg.h>
 #include <errno.h>
 
-#define BACKLOG 10
-#define BUF_SZ  4096
-#define VERSION "1.0.0"
+#define BACKLOG    10
+#define BUF_SZ     4096
 
-static int            dry_run   = 0;
-static int            do_update = 0;
-static char          *auth_key  = NULL;
-static socket_t       sockfd;
-static volatile int   terminate = 0;
+static volatile int terminate_flag = 0;
+static int          dry_run       = 0;
+static int          do_update     = 0;
+static char        *auth_key      = NULL;
+static socket_t     listener_fd;
 
 static void logp(const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
@@ -24,16 +23,49 @@ static void logp(const char *fmt, ...) {
 }
 
 static int run_cmd(const char *cmd) {
-  if (dry_run) {
-    logp("[DRY] %s", cmd);
-    return 0;
-  }
+  if (dry_run) { logp("[DRY] %s", cmd); return 0; }
   logp("[RUN] %s", cmd);
   return system(cmd);
 }
 
 static void handle_sig(int sig) {
-  (void)sig; terminate = 1;
+  (void)sig; terminate_flag = 1;
+}
+
+static void handle_get(socket_t c, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    char e[] = "ERROR: cannot open file\n";
+    send_enc(c, e, strlen(e), auth_key, strlen(auth_key));
+    return;
+  }
+  fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+  char hdr[64]; snprintf(hdr, sizeof(hdr), "FILE %ld\n", sz);
+  send_enc(c, hdr, strlen(hdr), auth_key, strlen(auth_key));
+  unsigned char buf[BUF_SZ];
+  size_t r;
+  while ((r = fread(buf, 1, BUF_SZ, f)) > 0)
+    send_enc(c, buf, r, auth_key, strlen(auth_key));
+  fclose(f);
+}
+
+static void handle_put(socket_t c, const char *path) {
+  char hdr[BUF_SZ];
+  ssize_t n = recv_enc(c, hdr, sizeof(hdr), auth_key, strlen(auth_key));
+  if (n <= 0) return;
+  long sz; if (sscanf(hdr, "PUTSIZE %ld", &sz) != 1) return;
+  FILE *f = fopen(path, "wb");
+  if (!f) return;
+  unsigned char buf[BUF_SZ]; long got = 0;
+  while (got < sz) {
+    n = recv_enc(c, buf, BUF_SZ, auth_key, strlen(auth_key));
+    if (n <= 0) break;
+    fwrite(buf, 1, n, f);
+    got += n;
+  }
+  fclose(f);
+  char ok[] = "OK\n";
+  send_enc(c, ok, strlen(ok), auth_key, strlen(auth_key));
 }
 
 static void *client_thread(void *arg) {
@@ -42,34 +74,37 @@ static void *client_thread(void *arg) {
   ssize_t n;
 
   /* Authentication */
-  n = recv(fd, buf, BUF_SZ-1, 0);
-  if (n <= 0) goto out;
-  buf[n] = 0;
+  n = recv_enc(fd, buf, BUF_SZ, auth_key, strlen(auth_key));
+  if (n <= 0) goto end;
+  buf[n-1] = '\0';
   if (strcmp(buf, auth_key) != 0) {
-    send(fd, "AUTH_FAIL\n", 10, 0);
-    goto out;
+    send_enc(fd, "AUTH_FAIL\n", 10, auth_key, strlen(auth_key));
+    goto end;
   }
-  send(fd, "OK\n", 3, 0);
+  send_enc(fd, "OK\n", 3, auth_key, strlen(auth_key));
 
-  while (!terminate) {
-    n = recv(fd, buf, BUF_SZ-1, 0);
-    if (n <= 0) break;
-    buf[n] = 0;
-    if (buf[n-1] == '\n') buf[n-1] = 0;
+  while (!terminate_flag && 
+         (n = recv_enc(fd, buf, BUF_SZ, auth_key, strlen(auth_key))) > 0) {
+    buf[n-1] = '\0';
     if (strcmp(buf, "exit") == 0) break;
-
+    if (strncmp(buf, "GET ", 4) == 0) {
+      handle_get(fd, buf+4); continue;
+    }
+    if (strncmp(buf, "PUT ", 4) == 0) {
+      handle_put(fd, buf+4); continue;
+    }
     FILE *p = popen(buf, "r");
     if (!p) {
       snprintf(buf, BUF_SZ, "ERROR: %s\n", strerror(errno));
-      send(fd, buf, strlen(buf), 0);
+      send_enc(fd, buf, strlen(buf), auth_key, strlen(auth_key));
       continue;
     }
     while (fgets(buf, BUF_SZ, p))
-      send(fd, buf, strlen(buf), 0);
+      send_enc(fd, buf, strlen(buf), auth_key, strlen(auth_key));
     pclose(p);
   }
 
-out:
+end:
   close_socket(fd);
   return NULL;
 }
@@ -79,15 +114,16 @@ int main(int argc, char **argv) {
   thread_t tid;
 
   init_net();
-  signal(SIGINT, handle_sig);
+  signal(SIGINT,  handle_sig);
   signal(SIGTERM, handle_sig);
 
-  /* parse options */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-u") == 0)      do_update = 1;
     else if (strcmp(argv[i], "-d") == 0) dry_run   = 1;
-    else if (strcmp(argv[i], "-k") == 0 && i+1<argc) auth_key = argv[++i];
-    else if (strcmp(argv[i], "-p") == 0 && i+1<argc) port     = atoi(argv[++i]);
+    else if (strcmp(argv[i], "-k") == 0 && i+1<argc)
+                                         auth_key  = argv[++i];
+    else if (strcmp(argv[i], "-p") == 0 && i+1<argc)
+                                         port      = atoi(argv[++i]);
   }
   if (!auth_key) {
     fprintf(stderr, "ERROR: auth key required (-k TOKEN)\n");
@@ -99,7 +135,6 @@ int main(int argc, char **argv) {
     run_cmd("apt-get upgrade -y");
   }
 
-  /* setup listener */
   struct addrinfo hints = {
     .ai_family   = AF_UNSPEC,
     .ai_socktype = SOCK_STREAM,
@@ -107,28 +142,26 @@ int main(int argc, char **argv) {
   }, *res;
   char portstr[6];
   snprintf(portstr, sizeof(portstr), "%d", port);
-  if (getaddrinfo(NULL, portstr, &hints, &res) != 0) {
-    perror("getaddrinfo"); return 1;
-  }
-  sockfd = socket(res->ai_family, res->ai_socktype, 0);
-  setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  bind(sockfd, res->ai_addr, res->ai_addrlen);
-  listen(sockfd, BACKLOG);
+  getaddrinfo(NULL, portstr, &hints, &res);
+
+  listener_fd = socket(res->ai_family, res->ai_socktype, 0);
+  setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  bind(listener_fd, res->ai_addr, res->ai_addrlen);
+  listen(listener_fd, BACKLOG);
   freeaddrinfo(res);
 
-  logp("Server v%s listening on port %d%s",
-       VERSION, port, dry_run ? " (dry-run)" : "");
+  logp("Server listening on port %d%s",
+       port, dry_run ? " (dry-run)" : "");
 
-  while (!terminate) {
-    struct sockaddr_storage ss;
-    socklen_t sl = sizeof(ss);
-    socket_t cfd = accept(sockfd, (struct sockaddr *)&ss, &sl);
+  while (!terminate_flag) {
+    struct sockaddr_storage ss; socklen_t sl = sizeof(ss);
+    socket_t cfd = accept(listener_fd, (struct sockaddr*)&ss, &sl);
     if (cfd < 0) continue;
-    thread_create(tid, client_thread, (void *)(uintptr_t)cfd);
+    thread_create(tid, client_thread, (void*)(uintptr_t)cfd);
   }
 
   logp("Shutting down");
-  close_socket(sockfd);
+  close_socket(listener_fd);
   cleanup_net();
   return 0;
 }
