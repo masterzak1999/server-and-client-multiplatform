@@ -1,78 +1,53 @@
-// client.c
-#include "common.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+// common.h
+#ifndef COMMON_H
+#define COMMON_H
 
-#define BUF_SZ 4096
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib,"ws2_32.lib")
+  typedef SOCKET      socket_t;
+  #define close_socket(s) closesocket(s)
+  #define sleep_ms(ms)    Sleep(ms)
+  static inline void init_net(void) { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); }
+  static inline void cleanup_net(void) { WSACleanup(); }
+  typedef HANDLE      thread_t;
+  #define thread_create(h,f,a) \
+    (h)=CreateThread(NULL,0,(LPTHREAD_START_ROUTINE)f,a,0,NULL)
+#else
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <arpa/inet.h>
+  #include <pthread.h>
+  typedef int         socket_t;
+  #define close_socket(s) close(s)
+  #define sleep_ms(ms)    usleep((ms)*1000)
+  static inline void init_net(void) {}
+  static inline void cleanup_net(void) {}
+  typedef pthread_t   thread_t;
+  #define thread_create(h,f,a) pthread_create(&(h),NULL,f,a)
+#endif
 
-static void usage(const char *prog) {
-  fprintf(stderr,
-    "Usage: %s -h HOST -p PORT -k TOKEN [-d]\n", prog);
-  exit(1);
+// XOR‐encrypt/decrypt
+static inline void xor_buf(unsigned char *buf, size_t n,
+                           const char *key, size_t keylen) {
+  for (size_t i = 0; i < n; i++) buf[i] ^= key[i % keylen];
+}
+static inline ssize_t send_enc(socket_t s, const void *data, size_t n,
+                               const char *key, size_t keylen) {
+  unsigned char *tmp = malloc(n);
+  memcpy(tmp, data, n);
+  xor_buf(tmp, n, key, keylen);
+  ssize_t r = send(s, tmp, n, 0);
+  free(tmp);
+  return r;
+}
+static inline ssize_t recv_enc(socket_t s, void *buf, size_t n,
+                               const char *key, size_t keylen) {
+  ssize_t r = recv(s, buf, n, 0);
+  if (r > 0) xor_buf((unsigned char*)buf, r, key, keylen);
+  return r;
 }
 
-int main(int argc, char **argv) {
-  char *host = NULL, *port = NULL, *key = NULL;
-  int  dry_run = 0;
-
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "-h") && i+1<argc) host = argv[++i];
-    else if (!strcmp(argv[i], "-p") && i+1<argc) port = argv[++i];
-    else if (!strcmp(argv[i], "-k") && i+1<argc) key  = argv[++i];
-    else if (!strcmp(argv[i], "-d"))             dry_run = 1;
-  }
-  if (!host || !port || !key) usage(argv[0]);
-
-  init_net();
-  socket_t sock;
-  if (!dry_run) {
-    struct addrinfo hints = {
-      .ai_family   = AF_UNSPEC,
-      .ai_socktype = SOCK_STREAM
-    }, *res;
-    getaddrinfo(host, port, &hints, &res);
-    sock = socket(res->ai_family, res->ai_socktype, 0);
-    connect(sock, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
-
-    send_enc(sock, key, strlen(key), key, strlen(key));
-    send_enc(sock, "\n", 1, key, strlen(key));
-
-    char ack[BUF_SZ];
-    recv_enc(sock, ack, sizeof(ack), key, strlen(key));
-    if (strncmp(ack, "OK", 2) != 0) {
-      fprintf(stderr, "Auth failed\n");
-      return 1;
-    }
-    printf("Connected to %s:%s\n", host, port);
-  }
-
-  char buf[BUF_SZ];
-  while (fgets(buf, BUF_SZ, stdin)) {
-    buf[strcspn(buf, "\n")] = '\0';
-    if (strcmp(buf, "exit") == 0) break;
-
-    if (dry_run) {
-      printf("[DRY] %s\n", buf);
-      continue;
-    }
-    if (!strncasecmp(buf, "GET ", 4) || !strncasecmp(buf, "PUT ", 4)) {
-      send_enc(sock, buf, strlen(buf), key, strlen(key));
-      send_enc(sock, "\n", 1, key, strlen(key));
-      /* handle in server */
-      continue;
-    }
-
-    send_enc(sock, buf, strlen(buf), key, strlen(key));
-    send_enc(sock, "\n", 1, key, strlen(key));
-
-    ssize_t n;
-    while ((n = recv_enc(sock, buf, BUF_SZ, key, strlen(key))) > 0)
-      printf("%.*s", (int)n, buf);
-  }
-
-  if (!dry_run) close_socket(sock);
-  cleanup_net();
-  return 0;
-}
+#endif // COMMON_H
